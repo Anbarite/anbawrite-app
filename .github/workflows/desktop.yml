@@ -110,15 +110,54 @@ jobs:
           } | ConvertTo-Json -Depth 4 |
             Set-Content src-tauri/tauri.windows.conf.json
 
+      - name: Configure macOS code signing
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_VALUE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_VALUE: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID_VALUE: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_VALUE: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_VALUE: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID_VALUE: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ -z "$APPLE_CERTIFICATE_VALUE" ]]; then
+            echo "No macOS signing certificate is configured."
+            exit 0
+          fi
+
+          append_env() {
+            local name="$1"
+            local value="$2"
+            local delimiter="ANBAWRITE_$(uuidgen)"
+
+            while printf '%s\n' "$value" | grep -Fqx "$delimiter"; do
+              delimiter="ANBAWRITE_$(uuidgen)"
+            done
+
+            {
+              printf '%s<<%s\n' "$name" "$delimiter"
+              printf '%s\n' "$value"
+              printf '%s\n' "$delimiter"
+            } >> "$GITHUB_ENV"
+          }
+
+          append_env_if_set() {
+            if [[ -n "$2" ]]; then
+              append_env "$1" "$2"
+            fi
+          }
+
+          append_env APPLE_CERTIFICATE "$APPLE_CERTIFICATE_VALUE"
+          append_env_if_set APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD_VALUE"
+          append_env_if_set APPLE_ID "$APPLE_ID_VALUE"
+          append_env_if_set APPLE_PASSWORD "$APPLE_PASSWORD_VALUE"
+          append_env_if_set APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY_VALUE"
+          append_env_if_set APPLE_TEAM_ID "$APPLE_TEAM_ID_VALUE"
+
       - name: Build and package AnbaWrite
         uses: tauri-apps/tauri-action@v1
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
