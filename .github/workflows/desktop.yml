@@ -41,7 +41,7 @@ jobs:
         with:
           repository: Anbarite/anbawrite
           ref: ${{ env.SOURCE_TAG }}
-          ssh-key: ${{ secrets.ANBAWRITE_SOURCE_DEPLOY_KEY }}
+          token: ${{ secrets.ANBAWRITE_SOURCE_TOKEN }}
           persist-credentials: false
 
       - name: Set up Node.js
