@@ -142,12 +142,18 @@ jobs:
             } >> "$GITHUB_ENV"
           }
 
+          append_env_if_set() {
+            if [[ -n "$2" ]]; then
+              append_env "$1" "$2"
+            fi
+          }
+
           append_env APPLE_CERTIFICATE "$APPLE_CERTIFICATE_VALUE"
-          append_env APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD_VALUE"
-          append_env APPLE_ID "$APPLE_ID_VALUE"
-          append_env APPLE_PASSWORD "$APPLE_PASSWORD_VALUE"
-          append_env APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY_VALUE"
-          append_env APPLE_TEAM_ID "$APPLE_TEAM_ID_VALUE"
+          append_env_if_set APPLE_CERTIFICATE_PASSWORD "$APPLE_CERTIFICATE_PASSWORD_VALUE"
+          append_env_if_set APPLE_ID "$APPLE_ID_VALUE"
+          append_env_if_set APPLE_PASSWORD "$APPLE_PASSWORD_VALUE"
+          append_env_if_set APPLE_SIGNING_IDENTITY "$APPLE_SIGNING_IDENTITY_VALUE"
+          append_env_if_set APPLE_TEAM_ID "$APPLE_TEAM_ID_VALUE"
 
       - name: Build and package AnbaWrite
         uses: tauri-apps/tauri-action@v1
