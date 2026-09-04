@@ -1,0 +1,134 @@
+name: Build desktop releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Private source tag to build (for example, desktop-v1.2.3)
+        required: true
+        type: string
+  push:
+    tags:
+      - desktop-v*
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-${{ github.event_name == 'push' && github.ref_name || inputs.source_tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.source_tag }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target aarch64-apple-darwin
+            rust-targets: aarch64-apple-darwin
+          - platform: windows-latest
+            args: --target x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v6
+        with:
+          repository: Anbarite/anbawrite
+          ref: ${{ env.SOURCE_TAG }}
+          ssh-key: ${{ secrets.ANBAWRITE_SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          cache: npm
+          node-version: 24
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Configure signed updater
+        env:
+          DESKTOP_RELEASE_TAG: ${{ env.SOURCE_TAG }}
+          DESKTOP_UPDATER_ENDPOINT: https://github.com/Anbarite/anbawrite-app/releases/latest/download/latest.json
+          TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npm run desktop:configure-updater
+
+      - name: Configure Windows code signing
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            Write-Host "No Windows signing certificate is configured."
+            exit 0
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_TIMESTAMP_URL)) {
+            throw "WINDOWS_TIMESTAMP_URL must be configured for signed builds."
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "anbawrite-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          )
+          $password = ConvertTo-SecureString `
+            $env:WINDOWS_CERTIFICATE_PASSWORD `
+            -AsPlainText `
+            -Force
+          $certificate = Import-PfxCertificate `
+            -FilePath $certificatePath `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password $password
+          @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $certificate.Thumbprint
+                digestAlgorithm = "sha256"
+                timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+              }
+            }
+          } | ConvertTo-Json -Depth 4 |
+            Set-Content src-tauri/tauri.windows.conf.json
+
+      - name: Build and package AnbaWrite
+        uses: tauri-apps/tauri-action@v1
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_DESKTOP_UPDATER_ENABLED: "true"
+        with:
+          args: ${{ matrix.args }} --config src-tauri/tauri.release.conf.json
+          releaseCommitish: ${{ github.sha }}
+          releaseDraft: true
+          releaseName: AnbaWrite Desktop v__VERSION__
+          tagName: ${{ env.SOURCE_TAG }}
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          uploadWorkflowArtifacts: true
