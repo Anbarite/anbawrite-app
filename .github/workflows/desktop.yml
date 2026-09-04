@@ -12,7 +12,7 @@ on:
       - desktop-v*
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: desktop-${{ github.event_name == 'push' && github.ref_name || inputs.source_tag }}
@@ -22,7 +22,59 @@ env:
   SOURCE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.source_tag }}
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      already_published: ${{ steps.release-state.outputs.already_published }}
+    steps:
+      - name: Check release state
+        id: release-state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$SOURCE_TAG" != desktop-v* || "$SOURCE_TAG" == "desktop-v" ]]; then
+            echo "SOURCE_TAG must use the desktop-v<version> format." >&2
+            exit 1
+          fi
+
+          release_json="$RUNNER_TEMP/release.json"
+          api_error="$RUNNER_TEMP/release-api-error.txt"
+          already_published=false
+
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_TAG" \
+            > "$release_json" 2> "$api_error"; then
+            draft="$(
+              jq -er '
+                if (.draft | type) == "boolean" then
+                  (.draft | tostring)
+                else
+                  error("release draft state is missing")
+                end
+              ' "$release_json"
+            )"
+            if [[ "$draft" == "false" ]]; then
+              already_published=true
+              echo "Release $SOURCE_TAG is already published; the build will be skipped."
+            else
+              echo "Release $SOURCE_TAG is still a draft and can be updated."
+            fi
+          elif grep -q "HTTP 404" "$api_error"; then
+            echo "Release $SOURCE_TAG does not exist yet."
+          else
+            cat "$api_error" >&2
+            exit 1
+          fi
+
+          echo "already_published=$already_published" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare
+    if: needs.prepare.outputs.already_published != 'true'
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +95,37 @@ jobs:
           ref: ${{ env.SOURCE_TAG }}
           token: ${{ secrets.ANBAWRITE_SOURCE_TOKEN }}
           persist-credentials: false
+
+      - name: Read release notes from source tag
+        id: release-notes
+        shell: bash
+        run: |
+          release_body=""
+          if git rev-parse --verify --quiet \
+            "refs/tags/$SOURCE_TAG^{tag}" > /dev/null 2>&1; then
+            release_body="$(
+              git for-each-ref \
+                --format='%(contents:subject)%0a%0a%(contents:body)' \
+                "refs/tags/$SOURCE_TAG"
+            )"
+          fi
+
+          if [[ -z "${release_body//[[:space:]]/}" ]]; then
+            release_body="Automated desktop release for $SOURCE_TAG."
+          fi
+
+          while true; do
+            delimiter="ANBAWRITE_RELEASE_NOTES_${RANDOM}_${RANDOM}_$$"
+            if ! grep -Fqx "$delimiter" <<< "$release_body"; then
+              break
+            fi
+          done
+
+          {
+            printf 'body<<%s\n' "$delimiter"
+            printf '%s\n' "$release_body"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -165,9 +248,128 @@ jobs:
         with:
           args: ${{ matrix.args }} --config src-tauri/tauri.release.conf.json
           releaseCommitish: ${{ github.sha }}
+          releaseBody: ${{ steps.release-notes.outputs.body }}
           releaseDraft: true
           releaseName: AnbaWrite Desktop v__VERSION__
           tagName: ${{ env.SOURCE_TAG }}
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           uploadWorkflowArtifacts: true
+
+  publish:
+    needs:
+      - prepare
+      - build
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        (
+          needs.prepare.outputs.already_published == 'true' ||
+          needs.build.result == 'success'
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Validate and publish draft release
+        shell: bash
+        env:
+          ALREADY_PUBLISHED: ${{ needs.prepare.outputs.already_published }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$ALREADY_PUBLISHED" == "true" ]]; then
+            echo "Release $SOURCE_TAG is already published; no assets were changed."
+            exit 0
+          fi
+
+          release_json="$RUNNER_TEMP/release.json"
+          assets_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$assets_dir"
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_TAG" \
+            > "$release_json"
+
+          jq -e --arg tag "$SOURCE_TAG" '
+            .tag_name == $tag and
+            .draft == true and
+            (.assets | any(.name == "latest.json"))
+          ' "$release_json" > /dev/null
+
+          gh release download "$SOURCE_TAG" \
+            --pattern latest.json \
+            --dir "$assets_dir" \
+            --clobber
+
+          manifest="$assets_dir/latest.json"
+          version="${SOURCE_TAG#desktop-v}"
+          jq -e --arg version "$version" '
+            .version == $version and
+            (.platforms["darwin-aarch64"].signature |
+              type == "string" and length > 0) and
+            (.platforms["darwin-aarch64"].url |
+              type == "string" and length > 0) and
+            (.platforms["windows-x86_64-nsis"].signature |
+              type == "string" and length > 0) and
+            (.platforms["windows-x86_64-nsis"].url |
+              type == "string" and length > 0)
+          ' "$manifest" > /dev/null
+
+          resolve_asset_name() {
+            local url="$1"
+            jq -er --arg url "$url" '
+              def without_query: sub("[?#].*$"; "");
+              ($url | without_query) as $clean_url |
+              [
+                .assets[] |
+                select(
+                  (.url | without_query) == $clean_url or
+                  (.browser_download_url | without_query) == $clean_url or
+                  (.id | tostring) == ($clean_url | split("/")[-1])
+                ) |
+                .name
+              ] |
+              if length == 1 then
+                .[0]
+              else
+                error("updater URL does not identify exactly one release asset")
+              end
+            ' "$release_json"
+          }
+
+          macos_archive="$(
+            resolve_asset_name "$(
+              jq -r '.platforms["darwin-aarch64"].url' "$manifest"
+            )"
+          )"
+          windows_installer="$(
+            resolve_asset_name "$(
+              jq -r '.platforms["windows-x86_64-nsis"].url' "$manifest"
+            )"
+          )"
+
+          if [[ "$macos_archive" != *.app.tar.gz ]]; then
+            echo "The macOS updater URL does not reference an app archive." >&2
+            exit 1
+          fi
+          if [[ "$windows_installer" != *-setup.exe ]]; then
+            echo "The Windows NSIS updater URL does not reference an installer." >&2
+            exit 1
+          fi
+
+          for asset in \
+            latest.json \
+            "$macos_archive" \
+            "$macos_archive.sig" \
+            "$windows_installer" \
+            "$windows_installer.sig"; do
+            if ! jq -e --arg asset "$asset" \
+              '.assets | any(.name == $asset)' \
+              "$release_json" > /dev/null; then
+              echo "Draft release is missing expected asset: $asset" >&2
+              exit 1
+            fi
+          done
+
+          gh release edit "$SOURCE_TAG" --draft=false --latest
