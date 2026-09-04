@@ -29,6 +29,9 @@ jobs:
     outputs:
       already_published: ${{ steps.release-state.outputs.already_published }}
     steps:
+      - name: Check out release automation
+        uses: actions/checkout@v6
+
       - name: Check release state
         id: release-state
         shell: bash
@@ -41,11 +44,15 @@ jobs:
           fi
 
           release_json="$RUNNER_TEMP/release.json"
-          api_error="$RUNNER_TEMP/release-api-error.txt"
           already_published=false
 
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_TAG" \
-            > "$release_json" 2> "$api_error"; then
+          set +e
+          .github/scripts/find-desktop-release.sh \
+            "$SOURCE_TAG" "$release_json" 4
+          find_status=$?
+          set -e
+
+          if ((find_status == 0)); then
             draft="$(
               jq -er '
                 if (.draft | type) == "boolean" then
@@ -61,11 +68,10 @@ jobs:
             else
               echo "Release $SOURCE_TAG is still a draft and can be updated."
             fi
-          elif grep -q "HTTP 404" "$api_error"; then
+          elif ((find_status == 4)); then
             echo "Release $SOURCE_TAG does not exist yet."
           else
-            cat "$api_error" >&2
-            exit 1
+            exit "$find_status"
           fi
 
           echo "already_published=$already_published" >> "$GITHUB_OUTPUT"
@@ -77,11 +83,17 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
+      # tauri-action merges platform entries by replacing latest.json.
+      # Serialize jobs so concurrent read-modify-write uploads cannot lose entries.
+      max-parallel: 1
       matrix:
         include:
           - platform: macos-latest
             args: --target aarch64-apple-darwin
             rust-targets: aarch64-apple-darwin
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+            rust-targets: x86_64-apple-darwin
           - platform: windows-latest
             args: --target x86_64-pc-windows-msvc
             rust-targets: x86_64-pc-windows-msvc
@@ -194,7 +206,7 @@ jobs:
             Set-Content src-tauri/tauri.windows.conf.json
 
       - name: Configure macOS code signing
-        if: matrix.platform == 'macos-latest'
+        if: runner.os == 'macOS'
         shell: bash
         env:
           APPLE_CERTIFICATE_VALUE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -273,6 +285,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out release automation
+        uses: actions/checkout@v6
+
       - name: Validate and publish draft release
         shell: bash
         env:
@@ -285,91 +300,60 @@ jobs:
           fi
 
           release_json="$RUNNER_TEMP/release.json"
+          final_release_json="$RUNNER_TEMP/final-release.json"
           assets_dir="$RUNNER_TEMP/release-assets"
           mkdir -p "$assets_dir"
 
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_TAG" \
-            > "$release_json"
+          .github/scripts/find-desktop-release.sh \
+            "$SOURCE_TAG" "$release_json" 6
 
-          jq -e --arg tag "$SOURCE_TAG" '
-            .tag_name == $tag and
-            .draft == true and
-            (.assets | any(.name == "latest.json"))
-          ' "$release_json" > /dev/null
-
-          gh release download "$SOURCE_TAG" \
-            --pattern latest.json \
-            --dir "$assets_dir" \
-            --clobber
-
-          manifest="$assets_dir/latest.json"
-          version="${SOURCE_TAG#desktop-v}"
-          jq -e --arg version "$version" '
-            .version == $version and
-            (.platforms["darwin-aarch64"].signature |
-              type == "string" and length > 0) and
-            (.platforms["darwin-aarch64"].url |
-              type == "string" and length > 0) and
-            (.platforms["windows-x86_64-nsis"].signature |
-              type == "string" and length > 0) and
-            (.platforms["windows-x86_64-nsis"].url |
-              type == "string" and length > 0)
-          ' "$manifest" > /dev/null
-
-          resolve_asset_name() {
-            local url="$1"
-            jq -er --arg url "$url" '
-              def without_query: sub("[?#].*$"; "");
-              ($url | without_query) as $clean_url |
-              [
-                .assets[] |
-                select(
-                  (.url | without_query) == $clean_url or
-                  (.browser_download_url | without_query) == $clean_url or
-                  (.id | tostring) == ($clean_url | split("/")[-1])
-                ) |
-                .name
-              ] |
+          release_id="$(jq -er '.id' "$release_json")"
+          latest_asset_id="$(
+            jq -er '
+              [.assets[] | select(.name == "latest.json")] |
               if length == 1 then
-                .[0]
+                .[0].id
               else
-                error("updater URL does not identify exactly one release asset")
+                error("draft release must contain exactly one latest.json")
               end
             ' "$release_json"
-          }
-
-          macos_archive="$(
-            resolve_asset_name "$(
-              jq -r '.platforms["darwin-aarch64"].url' "$manifest"
-            )"
-          )"
-          windows_installer="$(
-            resolve_asset_name "$(
-              jq -r '.platforms["windows-x86_64-nsis"].url' "$manifest"
-            )"
           )"
 
-          if [[ "$macos_archive" != *.app.tar.gz ]]; then
-            echo "The macOS updater URL does not reference an app archive." >&2
-            exit 1
-          fi
-          if [[ "$windows_installer" != *-setup.exe ]]; then
-            echo "The Windows NSIS updater URL does not reference an installer." >&2
-            exit 1
-          fi
+          manifest="$assets_dir/latest.json"
+          gh api \
+            -H "Accept: application/octet-stream" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$latest_asset_id" \
+            > "$manifest"
 
-          for asset in \
-            latest.json \
-            "$macos_archive" \
-            "$macos_archive.sig" \
-            "$windows_installer" \
-            "$windows_installer.sig"; do
-            if ! jq -e --arg asset "$asset" \
-              '.assets | any(.name == $asset)' \
-              "$release_json" > /dev/null; then
-              echo "Draft release is missing expected asset: $asset" >&2
+          .github/scripts/validate-desktop-release.sh \
+            "$SOURCE_TAG" "$release_json" "$manifest"
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            > "$final_release_json"
+          jq -e \
+            --arg tag "$SOURCE_TAG" \
+            --argjson id "$release_id" \
+            --argjson latest_asset_id "$latest_asset_id" '
+              .id == $id and
+              .tag_name == $tag and
+              .draft == true and
+              ([.assets[] | select(
+                .name == "latest.json" and .id == $latest_asset_id
+              )] | length == 1)
+            ' "$final_release_json" > /dev/null || {
+              echo "Draft release changed during validation; refusing to publish." >&2
               exit 1
-            fi
-          done
+            }
+          .github/scripts/validate-desktop-release.sh \
+            "$SOURCE_TAG" "$final_release_json" "$manifest"
 
-          gh release edit "$SOURCE_TAG" --draft=false --latest
+          gh api \
+            --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false \
+            -f make_latest=true |
+            jq -e \
+              --arg tag "$SOURCE_TAG" \
+              --argjson id "$release_id" '
+                .id == $id and .tag_name == $tag and .draft == false
+              ' > /dev/null
